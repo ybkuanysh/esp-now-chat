@@ -38,8 +38,10 @@ typedef struct __attribute__((packed)) {
     uint8_t origin[6];  // MAC of the board that wrote the message
     uint16_t seq;       // per-origin message counter
     uint8_t ttl;
-    uint8_t msg_type;   // MSG_TYPE_DATA / MSG_TYPE_ANNOUNCE
-    char text[200];     // must stay last: broadcast() trims trailing unused bytes
+    uint8_t msg_type;    // MSG_TYPE_DATA / MSG_TYPE_ANNOUNCE
+    uint8_t dest[6];     // DATA: final recipient MAC (unused for ANNOUNCE)
+    uint8_t next_hop[6]; // DATA: neighbour that must handle this frame right now
+    char text[200];      // must stay last: broadcast() trims trailing unused bytes
 } chat_msg_t;
 
 #define CHAT_MAGIC 0xC4A7
@@ -80,6 +82,7 @@ static void broadcast(const chat_msg_t *msg)
 typedef struct {
     bool     in_use;        // slot occupied?
     uint8_t  mac[6];        // origin MAC of the node
+    uint8_t  next_hop[6];   // neighbour to forward through to reach this node
     char     name[MAX_NAME_LEN]; // user name advertised by the node
     int8_t   rssi;          // last RSSI, only meaningful when rssi_valid
     bool     rssi_valid;    // true only while we hear the node directly (hops == 1)
@@ -116,7 +119,9 @@ static uint16_t next_seq(void)
 //  - The same seq arriving via another path lets us lower hops to the minimum
 //    and capture a direct-neighbour RSSI if this copy happens to be 1 hop.
 //  - RSSI is only kept while hops == 1; for far nodes it stays invalid (N/A).
-static void table_update(const uint8_t *origin, const char *name,
+// `via` is the immediate sender (info->src_addr) we received this copy from --
+// i.e. the next hop on the way back to `origin`. We store it as the route.
+static void table_update(const uint8_t *origin, const char *name, const uint8_t *via,
                          uint16_t seq, uint8_t hops, int8_t rssi)
 {
     if (!s_nodes_mtx) return;
@@ -139,6 +144,7 @@ static void table_update(const uint8_t *origin, const char *name,
         memset(n, 0, sizeof(*n));
         n->in_use       = true;
         memcpy(n->mac, origin, 6);
+        memcpy(n->next_hop, via, 6);
         snprintf(n->name, sizeof(n->name), "%s", name);
         n->last_seq     = seq;
         n->hops         = hops;
@@ -155,20 +161,74 @@ static void table_update(const uint8_t *origin, const char *name,
 
     int16_t d = (int16_t)(seq - n->last_seq);    // wrap-safe seq comparison
     if (d > 0) {
-        // Newer announce round: take its values as the new baseline.
+        // Newer announce round: take its values (and route) as the new baseline.
         n->last_seq     = seq;
         n->hops         = hops;
+        memcpy(n->next_hop, via, 6);
         n->rssi_valid   = (hops == 1);
         if (hops == 1) n->rssi = rssi;
     } else if (d == 0) {
         // Same round via a different path: prefer the shortest route...
-        if (hops < n->hops) n->hops = hops;
+        if (hops < n->hops) { n->hops = hops; memcpy(n->next_hop, via, 6); }
         // ...and grab RSSI if this particular copy reached us directly.
         if (hops == 1) { n->rssi = rssi; n->rssi_valid = true; }
     }
     // d < 0 (stale copy): nothing but the age refresh above.
 
     xSemaphoreGive(s_nodes_mtx);
+}
+
+// Look up a node by user name; return its MAC (final dest) and the next hop.
+static bool route_by_name(const char *name, uint8_t *dest, uint8_t *next_hop)
+{
+    bool found = false;
+    if (!s_nodes_mtx) return false;
+    xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (s_nodes[i].in_use && strcmp(s_nodes[i].name, name) == 0) {
+            memcpy(dest, s_nodes[i].mac, 6);
+            memcpy(next_hop, s_nodes[i].next_hop, 6);
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_nodes_mtx);
+    return found;
+}
+
+// Look up the next hop toward a known destination MAC (used while relaying).
+static bool route_by_mac(const uint8_t *dest, uint8_t *next_hop)
+{
+    bool found = false;
+    if (!s_nodes_mtx) return false;
+    xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (s_nodes[i].in_use && memcmp(s_nodes[i].mac, dest, 6) == 0) {
+            memcpy(next_hop, s_nodes[i].next_hop, 6);
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_nodes_mtx);
+    return found;
+}
+
+// Resolve a MAC to a user name for display; falls back to the raw MAC string.
+static void name_by_mac(const uint8_t *mac, char *out, size_t out_sz)
+{
+    if (s_nodes_mtx) {
+        xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (s_nodes[i].in_use && memcmp(s_nodes[i].mac, mac, 6) == 0) {
+                snprintf(out, out_sz, "%s", s_nodes[i].name);
+                xSemaphoreGive(s_nodes_mtx);
+                return;
+            }
+        }
+        xSemaphoreGive(s_nodes_mtx);
+    }
+    snprintf(out, out_sz, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
@@ -190,8 +250,9 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
 
         // IMPORTANT: update the table from EVERY copy first, so already_seen()
         // (which suppresses re-flooding) can never hide a better path from us.
-        // For ANNOUNCE the text field carries the sender's user name.
-        table_update(msg.origin, msg.text, msg.seq, hops, rssi);
+        // For ANNOUNCE the text field carries the sender's user name, and
+        // info->src_addr is the neighbour that relayed it to us (= next hop back).
+        table_update(msg.origin, msg.text, info->src_addr, msg.seq, hops, rssi);
 
         // relay-once: forward each (origin, seq) pair only a single time.
         if (already_seen(msg.origin, msg.seq)) return;
@@ -202,18 +263,27 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
         return;
     }
 
-    // ---- plain chat DATA ----
-    if (already_seen(msg.origin, msg.seq)) return;        // duplicate via another hop
+    // ---- routed unicast DATA ----
+    // Hop-by-hop routing over the broadcast medium: only the addressed next_hop
+    // reacts, everyone else drops the frame (so there is no flooding).
+    if (memcmp(msg.next_hop, s_my_mac, 6) != 0) return;   // not addressed to me
+    if (already_seen(msg.origin, msg.seq)) return;        // loop / duplicate guard
 
-    printf("[%02X:%02X:%02X:%02X:%02X:%02X] %s\n",
-           msg.origin[0], msg.origin[1], msg.origin[2],
-           msg.origin[3], msg.origin[4], msg.origin[5], msg.text);
-
-    // relay further into the mesh
-    if (msg.ttl > 0) {
-        msg.ttl--;
-        broadcast(&msg);
+    if (memcmp(msg.dest, s_my_mac, 6) == 0) {
+        // We are the final destination.
+        char from[18];
+        name_by_mac(msg.origin, from, sizeof(from));
+        printf("[%s] %s\n", from, msg.text);
+        return;
     }
+
+    // Otherwise forward one hop closer to the destination.
+    uint8_t nh[6];
+    if (msg.ttl == 0) return;                             // hop budget exhausted
+    if (!route_by_mac(msg.dest, nh)) return;              // route lost -> drop
+    msg.ttl--;
+    memcpy(msg.next_hop, nh, 6);
+    broadcast(&msg);
 }
 
 // Periodically shout an ANNOUNCE so neighbours can discover us. The beacon is
@@ -347,13 +417,13 @@ void app_main(void)
     xTaskCreate(announce_task, "announce", 3072, NULL, 4, NULL);
     xTaskCreate(reaper_task,   "reaper",   2560, NULL, 3, NULL);
 
-    printf("Type a message and press Enter. Type \"list\" to show the node table.\n");
+    printf("Commands:\n"
+           "  list                 - show the node table\n"
+           "  <name> <message>     - send <message> to the node called <name>\n");
 
-    chat_msg_t msg = { .magic = CHAT_MAGIC, .msg_type = MSG_TYPE_DATA };
-    memcpy(msg.origin, s_my_mac, 6);
-
-    uint8_t chunk[64];
+    char line[256];
     size_t line_len = 0;
+    uint8_t chunk[64];
 
     while (1) {
         int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), 20 / portTICK_PERIOD_MS);
@@ -361,19 +431,43 @@ void app_main(void)
             char c = (char)chunk[i];
             if (c == '\n' || c == '\r') {
                 if (line_len == 0) continue;
-                msg.text[line_len] = '\0';
-                if (strcmp(msg.text, "list") == 0) {
-                    print_table();            // console command, not sent over the air
-                } else {
-                    msg.seq = next_seq();
-                    msg.ttl = MSG_TTL;
-                    msg.msg_type = MSG_TYPE_DATA;
-                    broadcast(&msg);
-                    printf("[me] %s\n", msg.text);
-                }
+                line[line_len] = '\0';
                 line_len = 0;
-            } else if (line_len < sizeof(msg.text) - 1) {
-                msg.text[line_len++] = c;
+
+                if (strcmp(line, "list") == 0) {
+                    print_table();            // console command, not sent over the air
+                    continue;
+                }
+
+                // Split "<name> <message>" at the first space.
+                char *sp = strchr(line, ' ');
+                if (sp == NULL) {
+                    printf("usage: <name> <message>\n");
+                    continue;
+                }
+                *sp = '\0';
+                const char *target = line;       // e.g. "Adilet"
+                const char *body   = sp + 1;     // e.g. "привет мир"
+
+                uint8_t dest[6], nh[6];
+                if (!route_by_name(target, dest, nh)) {
+                    printf("user \"%s\" not found (try \"list\")\n", target);
+                    continue;
+                }
+
+                // Build a routed DATA frame: addressed to the next hop on the
+                // path, carrying the final destination so each hop can re-route.
+                chat_msg_t out = { .magic = CHAT_MAGIC, .msg_type = MSG_TYPE_DATA };
+                memcpy(out.origin,   s_my_mac, 6);
+                memcpy(out.dest,     dest, 6);
+                memcpy(out.next_hop, nh, 6);
+                out.seq = next_seq();
+                out.ttl = MSG_TTL;
+                snprintf(out.text, sizeof(out.text), "%s", body);
+                broadcast(&out);
+                printf("[me -> %s] %s\n", target, body);
+            } else if (line_len < sizeof(line) - 1) {
+                line[line_len++] = c;
             }
         }
     }
