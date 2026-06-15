@@ -23,6 +23,7 @@
 #define NODE_TIMEOUT_MS      10000   // drop a node after ~3 missed announces
 #define REAPER_INTERVAL_MS   1000    // how often we scan for stale nodes
 #define MAX_NAME_LEN         16      // stored/advertised user name length incl. NUL
+#define MAX_PATH_HOPS        6       // origin + up to MSG_TTL relays we can record
 
 // This node's human-readable name. Change it per board; it is broadcast inside
 // every ANNOUNCE so neighbours can label us in their node tables.
@@ -41,7 +42,9 @@ typedef struct __attribute__((packed)) {
     uint8_t msg_type;    // MSG_TYPE_DATA / MSG_TYPE_ANNOUNCE
     uint8_t dest[6];     // DATA: final recipient MAC (unused for ANNOUNCE)
     uint8_t next_hop[6]; // DATA: neighbour that must handle this frame right now
-    char text[200];      // must stay last: broadcast() trims trailing unused bytes
+    uint8_t path_len;    // DATA: number of MACs stored in path[]
+    uint8_t path[MAX_PATH_HOPS][6]; // DATA: origin + each relay, in travel order
+    char text[180];      // must stay last: broadcast() trims trailing unused bytes
 } chat_msg_t;
 
 #define CHAT_MAGIC 0xC4A7
@@ -213,9 +216,22 @@ static bool route_by_mac(const uint8_t *dest, uint8_t *next_hop)
     return found;
 }
 
+// Append a hop MAC to the message's travel path (no-op once it is full).
+static void path_append(chat_msg_t *m, const uint8_t *mac)
+{
+    if (m->path_len < MAX_PATH_HOPS) {
+        memcpy(m->path[m->path_len], mac, 6);
+        m->path_len++;
+    }
+}
+
 // Resolve a MAC to a user name for display; falls back to the raw MAC string.
 static void name_by_mac(const uint8_t *mac, char *out, size_t out_sz)
 {
+    if (memcmp(mac, s_my_mac, 6) == 0) {     // ourselves: not in our own table
+        snprintf(out, out_sz, "%s", USER_NAME);
+        return;
+    }
     if (s_nodes_mtx) {
         xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
         for (int i = 0; i < MAX_NODES; i++) {
@@ -270,17 +286,28 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     if (already_seen(msg.origin, msg.seq)) return;        // loop / duplicate guard
 
     if (memcmp(msg.dest, s_my_mac, 6) == 0) {
-        // We are the final destination.
-        char from[18];
-        name_by_mac(msg.origin, from, sizeof(from));
-        printf("[%s] %s\n", from, msg.text);
+        // We are the final destination: stamp ourselves and print the full path.
+        path_append(&msg, s_my_mac);
+
+        char path_str[160];
+        size_t pos = 0;
+        path_str[0] = '\0';
+        for (int k = 0; k < msg.path_len; k++) {
+            char nm[18];
+            name_by_mac(msg.path[k], nm, sizeof(nm));
+            pos += snprintf(path_str + pos, sizeof(path_str) - pos,
+                            "%s%s", (k == 0) ? "" : " -> ", nm);
+            if (pos >= sizeof(path_str)) break;
+        }
+        printf("[%s] %s\n", path_str, msg.text);
         return;
     }
 
-    // Otherwise forward one hop closer to the destination.
+    // Otherwise forward one hop closer to the destination, recording our hop.
     uint8_t nh[6];
     if (msg.ttl == 0) return;                             // hop budget exhausted
     if (!route_by_mac(msg.dest, nh)) return;              // route lost -> drop
+    path_append(&msg, s_my_mac);
     msg.ttl--;
     memcpy(msg.next_hop, nh, 6);
     broadcast(&msg);
@@ -463,6 +490,7 @@ void app_main(void)
                 memcpy(out.next_hop, nh, 6);
                 out.seq = next_seq();
                 out.ttl = MSG_TTL;
+                path_append(&out, s_my_mac);   // path starts at the origin
                 snprintf(out.text, sizeof(out.text), "%s", body);
                 broadcast(&out);
                 printf("[me -> %s] %s\n", target, body);
