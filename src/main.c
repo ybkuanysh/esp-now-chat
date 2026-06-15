@@ -22,6 +22,11 @@
 #define ANNOUNCE_INTERVAL_MS 3000    // how often we shout our presence
 #define NODE_TIMEOUT_MS      10000   // drop a node after ~3 missed announces
 #define REAPER_INTERVAL_MS   1000    // how often we scan for stale nodes
+#define MAX_NAME_LEN         16      // stored/advertised user name length incl. NUL
+
+// This node's human-readable name. Change it per board; it is broadcast inside
+// every ANNOUNCE so neighbours can label us in their node tables.
+#define USER_NAME            "kuanysh"
 
 // message kinds carried in chat_msg_t.msg_type
 #define MSG_TYPE_DATA     0   // user chat text (default => existing behaviour)
@@ -75,6 +80,7 @@ static void broadcast(const chat_msg_t *msg)
 typedef struct {
     bool     in_use;        // slot occupied?
     uint8_t  mac[6];        // origin MAC of the node
+    char     name[MAX_NAME_LEN]; // user name advertised by the node
     int8_t   rssi;          // last RSSI, only meaningful when rssi_valid
     bool     rssi_valid;    // true only while we hear the node directly (hops == 1)
     uint8_t  hops;          // minimum observed hop distance to the node
@@ -110,7 +116,8 @@ static uint16_t next_seq(void)
 //  - The same seq arriving via another path lets us lower hops to the minimum
 //    and capture a direct-neighbour RSSI if this copy happens to be 1 hop.
 //  - RSSI is only kept while hops == 1; for far nodes it stays invalid (N/A).
-static void table_update(const uint8_t *origin, uint16_t seq, uint8_t hops, int8_t rssi)
+static void table_update(const uint8_t *origin, const char *name,
+                         uint16_t seq, uint8_t hops, int8_t rssi)
 {
     if (!s_nodes_mtx) return;
     xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
@@ -132,6 +139,7 @@ static void table_update(const uint8_t *origin, uint16_t seq, uint8_t hops, int8
         memset(n, 0, sizeof(*n));
         n->in_use       = true;
         memcpy(n->mac, origin, 6);
+        snprintf(n->name, sizeof(n->name), "%s", name);
         n->last_seq     = seq;
         n->hops         = hops;
         n->rssi_valid   = (hops == 1);
@@ -143,6 +151,7 @@ static void table_update(const uint8_t *origin, uint16_t seq, uint8_t hops, int8
 
     node_entry_t *n = &s_nodes[idx];
     n->last_seen_ms = now;                       // refresh AGE on ANY copy
+    snprintf(n->name, sizeof(n->name), "%s", name); // name may change at runtime
 
     int16_t d = (int16_t)(seq - n->last_seq);    // wrap-safe seq comparison
     if (d > 0) {
@@ -181,7 +190,8 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
 
         // IMPORTANT: update the table from EVERY copy first, so already_seen()
         // (which suppresses re-flooding) can never hide a better path from us.
-        table_update(msg.origin, msg.seq, hops, rssi);
+        // For ANNOUNCE the text field carries the sender's user name.
+        table_update(msg.origin, msg.text, msg.seq, hops, rssi);
 
         // relay-once: forward each (origin, seq) pair only a single time.
         if (already_seen(msg.origin, msg.seq)) return;
@@ -212,7 +222,8 @@ static void announce_task(void *arg)
 {
     chat_msg_t msg = { .magic = CHAT_MAGIC, .msg_type = MSG_TYPE_ANNOUNCE };
     memcpy(msg.origin, s_my_mac, 6);
-    msg.text[0] = '\0';                 // no payload -> minimal packet size
+    // ANNOUNCE payload is just our user name (kept short to stay well under 250B).
+    snprintf(msg.text, sizeof(msg.text), "%s", USER_NAME);
 
     while (1) {
         msg.seq = next_seq();
@@ -252,7 +263,7 @@ static void print_table(void)
     memcpy(snap, s_nodes, sizeof(snap));
     xSemaphoreGive(s_nodes_mtx);
 
-    printf("%-3s%-20s%-6s%-6s%s\n", "#", "MAC", "RSSI", "HOPS", "AGE");
+    printf("%-3s%-20s%-12s%-6s%-6s%s\n", "#", "MAC", "NAME", "RSSI", "HOPS", "AGE");
     int row = 0;
     for (int i = 0; i < MAX_NODES; i++) {
         node_entry_t *n = &snap[i];
@@ -268,7 +279,7 @@ static void print_table(void)
         if (n->rssi_valid) snprintf(rssi_str, sizeof(rssi_str), "%d", n->rssi);
         else               snprintf(rssi_str, sizeof(rssi_str), "N/A");
 
-        printf("%-3d%-20s%-6s%-6u%lus\n", row, mac_str, rssi_str, n->hops, (unsigned long)age_s);
+        printf("%-3d%-20s%-12s%-6s%-6u%lus\n", row, mac_str, n->name, rssi_str, n->hops, (unsigned long)age_s);
         row++;
     }
     if (row == 0) printf("(no nodes seen yet)\n");
