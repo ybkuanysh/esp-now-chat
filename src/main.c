@@ -11,40 +11,41 @@
 #include "esp_timer.h"
 #include "freertos/semphr.h"
 
-#define BUF_SIZE        1024
-#define WIFI_CHANNEL    1   // must be the same on all boards
-#define MSG_TTL         5   // max hops through the mesh
-#define INITIAL_TTL     MSG_TTL  // ttl an ANNOUNCE starts with (used by hops formula)
-#define DEDUP_SIZE      16  // remembered messages for flood suppression
+#define BUF_SIZE 1024
+#define WIFI_CHANNEL 1      // must be the same on all boards
+#define MSG_TTL 5           // max hops through the mesh
+#define INITIAL_TTL MSG_TTL // ttl an ANNOUNCE starts with (used by hops formula)
+#define DEDUP_SIZE 16       // remembered messages for flood suppression
 
 // ---- node discovery configuration ----
-#define MAX_NODES            16      // fixed-size visible-node table, no malloc
-#define ANNOUNCE_INTERVAL_MS 3000    // how often we shout our presence
-#define NODE_TIMEOUT_MS      10000   // drop a node after ~3 missed announces
-#define REAPER_INTERVAL_MS   1000    // how often we scan for stale nodes
-#define MAX_NAME_LEN         16      // stored/advertised user name length incl. NUL
-#define MAX_PATH_HOPS        6       // origin + up to MSG_TTL relays we can record
+#define MAX_NODES 16              // fixed-size visible-node table, no malloc
+#define ANNOUNCE_INTERVAL_MS 3000 // how often we shout our presence
+#define NODE_TIMEOUT_MS 10000     // drop a node after ~3 missed announces
+#define REAPER_INTERVAL_MS 1000   // how often we scan for stale nodes
+#define MAX_NAME_LEN 16           // stored/advertised user name length incl. NUL
+#define MAX_PATH_HOPS 6           // origin + up to MSG_TTL relays we can record
 
 // This node's human-readable name. Change it per board; it is broadcast inside
 // every ANNOUNCE so neighbours can label us in their node tables.
-#define USER_NAME            "kuanysh"
+#define USER_NAME "kuanysh"
 
 // message kinds carried in chat_msg_t.msg_type
-#define MSG_TYPE_DATA     0   // user chat text (default => existing behaviour)
-#define MSG_TYPE_ANNOUNCE 1   // presence beacon for node discovery
+#define MSG_TYPE_DATA 0     // user chat text (default => existing behaviour)
+#define MSG_TYPE_ANNOUNCE 1 // presence beacon for node discovery
 
 // ESP-NOW payload is limited to 250 bytes total
-typedef struct __attribute__((packed)) {
-    uint16_t magic;     // filter out foreign ESP-NOW traffic
-    uint8_t origin[6];  // MAC of the board that wrote the message
-    uint16_t seq;       // per-origin message counter
+typedef struct __attribute__((packed))
+{
+    uint16_t magic;    // filter out foreign ESP-NOW traffic
+    uint8_t origin[6]; // MAC of the board that wrote the message
+    uint16_t seq;      // per-origin message counter
     uint8_t ttl;
-    uint8_t msg_type;    // MSG_TYPE_DATA / MSG_TYPE_ANNOUNCE
-    uint8_t dest[6];     // DATA: final recipient MAC (unused for ANNOUNCE)
-    uint8_t next_hop[6]; // DATA: neighbour that must handle this frame right now
-    uint8_t path_len;    // DATA: number of MACs stored in path[]
+    uint8_t msg_type;               // MSG_TYPE_DATA / MSG_TYPE_ANNOUNCE
+    uint8_t dest[6];                // DATA: final recipient MAC (unused for ANNOUNCE)
+    uint8_t next_hop[6];            // DATA: neighbour that must handle this frame right now
+    uint8_t path_len;               // DATA: number of MACs stored in path[]
     uint8_t path[MAX_PATH_HOPS][6]; // DATA: origin + each relay, in travel order
-    char text[180];      // must stay last: broadcast() trims trailing unused bytes
+    char text[180];                 // must stay last: broadcast() trims trailing unused bytes
 } chat_msg_t;
 
 #define CHAT_MAGIC 0xC4A7
@@ -54,13 +55,19 @@ static uint8_t s_my_mac[6];
 static uint16_t s_my_seq = 0;
 
 // ring buffer of already seen (origin, seq) pairs
-static struct { uint8_t mac[6]; uint16_t seq; } s_seen[DEDUP_SIZE];
+static struct
+{
+    uint8_t mac[6];
+    uint16_t seq;
+} s_seen[DEDUP_SIZE];
 static int s_seen_pos = 0;
 
 static bool already_seen(const uint8_t *mac, uint16_t seq)
 {
-    for (int i = 0; i < DEDUP_SIZE; i++) {
-        if (s_seen[i].seq == seq && memcmp(s_seen[i].mac, mac, 6) == 0) {
+    for (int i = 0; i < DEDUP_SIZE; i++)
+    {
+        if (s_seen[i].seq == seq && memcmp(s_seen[i].mac, mac, 6) == 0)
+        {
             return true;
         }
     }
@@ -74,7 +81,8 @@ static void broadcast(const chat_msg_t *msg)
 {
     size_t len = sizeof(*msg) - sizeof(msg->text) + strlen(msg->text) + 1;
     esp_err_t err = esp_now_send(BROADCAST_MAC, (const uint8_t *)msg, len);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         printf("esp_now_send failed: %s\n", esp_err_to_name(err));
     }
 }
@@ -82,20 +90,21 @@ static void broadcast(const chat_msg_t *msg)
 // ---------------------------------------------------------------------------
 // Node discovery table
 // ---------------------------------------------------------------------------
-typedef struct {
-    bool     in_use;        // slot occupied?
-    uint8_t  mac[6];        // origin MAC of the node
-    uint8_t  next_hop[6];   // neighbour to forward through to reach this node
-    char     name[MAX_NAME_LEN]; // user name advertised by the node
-    int8_t   rssi;          // last RSSI, only meaningful when rssi_valid
-    bool     rssi_valid;    // true only while we hear the node directly (hops == 1)
-    uint8_t  hops;          // minimum observed hop distance to the node
-    uint32_t last_seen_ms;  // timestamp of the last copy we received
-    uint16_t last_seq;      // newest announce round seen from this node
+typedef struct
+{
+    bool in_use;             // slot occupied?
+    uint8_t mac[6];          // origin MAC of the node
+    uint8_t next_hop[6];     // neighbour to forward through to reach this node
+    char name[MAX_NAME_LEN]; // user name advertised by the node
+    int8_t rssi;             // last RSSI, only meaningful when rssi_valid
+    bool rssi_valid;         // true only while we hear the node directly (hops == 1)
+    uint8_t hops;            // minimum observed hop distance to the node
+    uint32_t last_seen_ms;   // timestamp of the last copy we received
+    uint16_t last_seq;       // newest announce round seen from this node
 } node_entry_t;
 
-static node_entry_t s_nodes[MAX_NODES];   // fixed table, no dynamic memory
-static SemaphoreHandle_t s_nodes_mtx;     // guards s_nodes (taken in Wi-Fi task!)
+static node_entry_t s_nodes[MAX_NODES]; // fixed table, no dynamic memory
+static SemaphoreHandle_t s_nodes_mtx;   // guards s_nodes (taken in Wi-Fi task!)
 
 // seq is bumped from both the console task and the announce task -> protect it.
 static portMUX_TYPE s_seq_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -103,6 +112,60 @@ static portMUX_TYPE s_seq_mux = portMUX_INITIALIZER_UNLOCKED;
 static inline uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* ── peer manager ────────────────────────────────────────────────────────── */
+/*
+ * ESP-NOW требует, чтобы адрес назначения был заранее добавлен через
+ * esp_now_add_peer(). Мы управляем этим динамически:
+ *   - При появлении нового next_hop-соседа добавляем его как peer.
+ *   - При истечении записи удаляем его.
+ *
+ * ВАЖНО: peer — это непосредственный сосед (next_hop), а не конечный
+ * получатель. Для multi-hop достаточно знать только следующий прыжок.
+ */
+static void peer_ensure_added(const uint8_t *mac)
+{
+    if (esp_now_is_peer_exist(mac)) return;
+
+    esp_now_peer_info_t p = {
+        .channel = WIFI_CHANNEL,
+        .ifidx   = WIFI_IF_STA,
+        .encrypt = false,
+    };
+    memcpy(p.peer_addr, mac, 6);
+    esp_err_t err = esp_now_add_peer(&p);
+    if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
+        printf("[peer] add %02X:%02X:%02X:%02X:%02X:%02X failed: %s\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+               esp_err_to_name(err));
+    }
+}
+
+static void peer_remove(const uint8_t *mac)
+{
+    if (!esp_now_is_peer_exist(mac)) return;
+    esp_now_del_peer(mac);
+}
+
+/*
+ * Unicast: отправить фрейм конкретному соседу.
+ * Перед отправкой убеждаемся, что peer добавлен.
+ * Возвращает true при успехе.
+ */
+static bool send_unicast(const uint8_t *neighbor_mac, const chat_msg_t *msg)
+{
+    peer_ensure_added(neighbor_mac);
+    size_t len = sizeof(*msg) - sizeof(msg->text) + strlen(msg->text) + 1;
+    esp_err_t err = esp_now_send(neighbor_mac, (const uint8_t *)msg, len);
+    if (err != ESP_OK) {
+        printf("unicast to %02X:%02X:%02X:%02X:%02X:%02X failed: %s\n",
+               neighbor_mac[0], neighbor_mac[1], neighbor_mac[2],
+               neighbor_mac[3], neighbor_mac[4], neighbor_mac[5],
+               esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 static uint16_t next_seq(void)
@@ -127,54 +190,81 @@ static uint16_t next_seq(void)
 static void table_update(const uint8_t *origin, const char *name, const uint8_t *via,
                          uint16_t seq, uint8_t hops, int8_t rssi)
 {
-    if (!s_nodes_mtx) return;
+    if (!s_nodes_mtx)
+        return;
     xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
 
     uint32_t now = now_ms();
     int idx = -1, free_idx = -1;
-    for (int i = 0; i < MAX_NODES; i++) {
-        if (s_nodes[i].in_use) {
-            if (memcmp(s_nodes[i].mac, origin, 6) == 0) { idx = i; break; }
-        } else if (free_idx < 0) {
+    for (int i = 0; i < MAX_NODES; i++)
+    {
+        if (s_nodes[i].in_use)
+        {
+            if (memcmp(s_nodes[i].mac, origin, 6) == 0)
+            {
+                idx = i;
+                break;
+            }
+        }
+        else if (free_idx < 0)
+        {
             free_idx = i;
         }
     }
 
-    if (idx < 0) {
+    if (idx < 0)
+    {
         // First time we see this node; create an entry if there's room.
-        if (free_idx < 0) { xSemaphoreGive(s_nodes_mtx); return; } // table full
+        if (free_idx < 0)
+        {
+            xSemaphoreGive(s_nodes_mtx);
+            return;
+        } // table full
         node_entry_t *n = &s_nodes[free_idx];
         memset(n, 0, sizeof(*n));
-        n->in_use       = true;
+        n->in_use = true;
         memcpy(n->mac, origin, 6);
         memcpy(n->next_hop, via, 6);
         snprintf(n->name, sizeof(n->name), "%s", name);
-        n->last_seq     = seq;
-        n->hops         = hops;
-        n->rssi_valid   = (hops == 1);
-        if (hops == 1) n->rssi = rssi;
+        n->last_seq = seq;
+        n->hops = hops;
+        n->rssi_valid = (hops == 1);
+        if (hops == 1)
+            n->rssi = rssi;
         n->last_seen_ms = now;
         xSemaphoreGive(s_nodes_mtx);
         return;
     }
 
     node_entry_t *n = &s_nodes[idx];
-    n->last_seen_ms = now;                       // refresh AGE on ANY copy
+    n->last_seen_ms = now;                          // refresh AGE on ANY copy
     snprintf(n->name, sizeof(n->name), "%s", name); // name may change at runtime
 
-    int16_t d = (int16_t)(seq - n->last_seq);    // wrap-safe seq comparison
-    if (d > 0) {
+    int16_t d = (int16_t)(seq - n->last_seq); // wrap-safe seq comparison
+    if (d > 0)
+    {
         // Newer announce round: take its values (and route) as the new baseline.
-        n->last_seq     = seq;
-        n->hops         = hops;
+        n->last_seq = seq;
+        n->hops = hops;
         memcpy(n->next_hop, via, 6);
-        n->rssi_valid   = (hops == 1);
-        if (hops == 1) n->rssi = rssi;
-    } else if (d == 0) {
+        n->rssi_valid = (hops == 1);
+        if (hops == 1)
+            n->rssi = rssi;
+    }
+    else if (d == 0)
+    {
         // Same round via a different path: prefer the shortest route...
-        if (hops < n->hops) { n->hops = hops; memcpy(n->next_hop, via, 6); }
+        if (hops < n->hops)
+        {
+            n->hops = hops;
+            memcpy(n->next_hop, via, 6);
+        }
         // ...and grab RSSI if this particular copy reached us directly.
-        if (hops == 1) { n->rssi = rssi; n->rssi_valid = true; }
+        if (hops == 1)
+        {
+            n->rssi = rssi;
+            n->rssi_valid = true;
+        }
     }
     // d < 0 (stale copy): nothing but the age refresh above.
 
@@ -185,10 +275,13 @@ static void table_update(const uint8_t *origin, const char *name, const uint8_t 
 static bool route_by_name(const char *name, uint8_t *dest, uint8_t *next_hop)
 {
     bool found = false;
-    if (!s_nodes_mtx) return false;
+    if (!s_nodes_mtx)
+        return false;
     xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
-    for (int i = 0; i < MAX_NODES; i++) {
-        if (s_nodes[i].in_use && strcmp(s_nodes[i].name, name) == 0) {
+    for (int i = 0; i < MAX_NODES; i++)
+    {
+        if (s_nodes[i].in_use && strcmp(s_nodes[i].name, name) == 0)
+        {
             memcpy(dest, s_nodes[i].mac, 6);
             memcpy(next_hop, s_nodes[i].next_hop, 6);
             found = true;
@@ -203,10 +296,13 @@ static bool route_by_name(const char *name, uint8_t *dest, uint8_t *next_hop)
 static bool route_by_mac(const uint8_t *dest, uint8_t *next_hop)
 {
     bool found = false;
-    if (!s_nodes_mtx) return false;
+    if (!s_nodes_mtx)
+        return false;
     xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
-    for (int i = 0; i < MAX_NODES; i++) {
-        if (s_nodes[i].in_use && memcmp(s_nodes[i].mac, dest, 6) == 0) {
+    for (int i = 0; i < MAX_NODES; i++)
+    {
+        if (s_nodes[i].in_use && memcmp(s_nodes[i].mac, dest, 6) == 0)
+        {
             memcpy(next_hop, s_nodes[i].next_hop, 6);
             found = true;
             break;
@@ -219,7 +315,8 @@ static bool route_by_mac(const uint8_t *dest, uint8_t *next_hop)
 // Append a hop MAC to the message's travel path (no-op once it is full).
 static void path_append(chat_msg_t *m, const uint8_t *mac)
 {
-    if (m->path_len < MAX_PATH_HOPS) {
+    if (m->path_len < MAX_PATH_HOPS)
+    {
         memcpy(m->path[m->path_len], mac, 6);
         m->path_len++;
     }
@@ -228,14 +325,18 @@ static void path_append(chat_msg_t *m, const uint8_t *mac)
 // Resolve a MAC to a user name for display; falls back to the raw MAC string.
 static void name_by_mac(const uint8_t *mac, char *out, size_t out_sz)
 {
-    if (memcmp(mac, s_my_mac, 6) == 0) {     // ourselves: not in our own table
+    if (memcmp(mac, s_my_mac, 6) == 0)
+    { // ourselves: not in our own table
         snprintf(out, out_sz, "%s", USER_NAME);
         return;
     }
-    if (s_nodes_mtx) {
+    if (s_nodes_mtx)
+    {
         xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
-        for (int i = 0; i < MAX_NODES; i++) {
-            if (s_nodes[i].in_use && memcmp(s_nodes[i].mac, mac, 6) == 0) {
+        for (int i = 0; i < MAX_NODES; i++)
+        {
+            if (s_nodes[i].in_use && memcmp(s_nodes[i].mac, mac, 6) == 0)
+            {
                 snprintf(out, out_sz, "%s", s_nodes[i].name);
                 xSemaphoreGive(s_nodes_mtx);
                 return;
@@ -249,7 +350,8 @@ static void name_by_mac(const uint8_t *mac, char *out, size_t out_sz)
 
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
-    if (len < (int)(sizeof(chat_msg_t) - sizeof(((chat_msg_t *)0)->text) + 1)) {
+    if (len < (int)(sizeof(chat_msg_t) - sizeof(((chat_msg_t *)0)->text) + 1))
+    {
         return;
     }
     chat_msg_t msg;
@@ -262,7 +364,7 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     if (msg.msg_type == MSG_TYPE_ANNOUNCE) {
         // Direct neighbour => received_ttl == INITIAL_TTL => hops == 1.
         uint8_t hops = (uint8_t)(INITIAL_TTL - msg.ttl + 1);
-        int8_t  rssi = info->rx_ctrl->rssi;   // rx_ctrl is a pointer in esp_now_recv_info_t
+        int8_t rssi = info->rx_ctrl->rssi; // rx_ctrl is a pointer in esp_now_recv_info_t
 
         // IMPORTANT: update the table from EVERY copy first, so already_seen()
         // (which suppresses re-flooding) can never hide a better path from us.
@@ -271,8 +373,10 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
         table_update(msg.origin, msg.text, info->src_addr, msg.seq, hops, rssi);
 
         // relay-once: forward each (origin, seq) pair only a single time.
-        if (already_seen(msg.origin, msg.seq)) return;
-        if (msg.ttl > 0) {
+        if (already_seen(msg.origin, msg.seq))
+            return;
+        if (msg.ttl > 0)
+        {
             msg.ttl--;
             broadcast(&msg);
         }
@@ -282,31 +386,47 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     // ---- routed unicast DATA ----
     // Hop-by-hop routing over the broadcast medium: only the addressed next_hop
     // reacts, everyone else drops the frame (so there is no flooding).
-    if (memcmp(msg.next_hop, s_my_mac, 6) != 0) return;   // not addressed to me
-    if (already_seen(msg.origin, msg.seq)) return;        // loop / duplicate guard
+    // if (memcmp(msg.next_hop, s_my_mac, 6) != 0)
+    //     return; // not addressed to me
+    if (already_seen(msg.origin, msg.seq))
+        return; // loop / duplicate guard
 
-    if (memcmp(msg.dest, s_my_mac, 6) == 0) {
+    if (memcmp(msg.dest, s_my_mac, 6) == 0)
+    {
         // We are the final destination: stamp ourselves and print the full path.
         path_append(&msg, s_my_mac);
 
         char path_str[160];
         size_t pos = 0;
         path_str[0] = '\0';
-        for (int k = 0; k < msg.path_len; k++) {
+        for (int k = 0; k < msg.path_len; k++)
+        {
             char nm[18];
             name_by_mac(msg.path[k], nm, sizeof(nm));
             pos += snprintf(path_str + pos, sizeof(path_str) - pos,
                             "%s%s", (k == 0) ? "" : " -> ", nm);
-            if (pos >= sizeof(path_str)) break;
+            if (pos >= sizeof(path_str))
+                break;
         }
         printf("[%s] %s\n", path_str, msg.text);
         return;
     }
+    else // Читаем чужое сообщение
+    {
+        char nm[18];
+        name_by_mac(msg.origin, nm, sizeof(nm));
+        printf("[перехвачено от %s] %s\n", nm, msg.text);
+    }
+
+    if (memcmp(msg.next_hop, s_my_mac, 6) != 0)
+        return; // not addressed to me
 
     // Otherwise forward one hop closer to the destination, recording our hop.
     uint8_t nh[6];
-    if (msg.ttl == 0) return;                             // hop budget exhausted
-    if (!route_by_mac(msg.dest, nh)) return;              // route lost -> drop
+    if (msg.ttl == 0)
+        return; // hop budget exhausted
+    if (!route_by_mac(msg.dest, nh))
+        return; // route lost -> drop
     path_append(&msg, s_my_mac);
     msg.ttl--;
     memcpy(msg.next_hop, nh, 6);
@@ -317,12 +437,13 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
 // flooded just like chat: ttl = INITIAL_TTL, decremented on each relay.
 static void announce_task(void *arg)
 {
-    chat_msg_t msg = { .magic = CHAT_MAGIC, .msg_type = MSG_TYPE_ANNOUNCE };
+    chat_msg_t msg = {.magic = CHAT_MAGIC, .msg_type = MSG_TYPE_ANNOUNCE};
     memcpy(msg.origin, s_my_mac, 6);
     // ANNOUNCE payload is just our user name (kept short to stay well under 250B).
     snprintf(msg.text, sizeof(msg.text), "%s", USER_NAME);
 
-    while (1) {
+    while (1)
+    {
         msg.seq = next_seq();
         msg.ttl = INITIAL_TTL;
         broadcast(&msg);
@@ -330,17 +451,30 @@ static void announce_task(void *arg)
     }
 }
 
-// Periodically expire nodes we haven't heard from in NODE_TIMEOUT_MS.
+/* ── reaper task ─────────────────────────────────────────────────────────── */
+/*
+ * Удаляем просроченные записи из таблицы И из списка ESP-NOW peers.
+ * Прямые соседи (hops==1) были добавлены как peers — их нужно убрать.
+ */
 static void reaper_task(void *arg)
 {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(REAPER_INTERVAL_MS));
         uint32_t now = now_ms();
+
         xSemaphoreTake(s_nodes_mtx, portMAX_DELAY);
         for (int i = 0; i < MAX_NODES; i++) {
-            if (s_nodes[i].in_use &&
-                (now - s_nodes[i].last_seen_ms) > NODE_TIMEOUT_MS) {
+            if (!s_nodes[i].in_use) continue;
+            if ((now - s_nodes[i].last_seen_ms) > NODE_TIMEOUT_MS) {
+                uint8_t mac[6];
+                memcpy(mac, s_nodes[i].mac, 6);
+                bool was_direct = (s_nodes[i].hops == 1);
                 s_nodes[i].in_use = false;
+                xSemaphoreGive(s_nodes_mtx);  // освобождаем до esp_now_del_peer
+
+                if (was_direct) peer_remove(mac);
+
+                xSemaphoreTake(s_nodes_mtx, portMAX_DELAY); // берём снова
             }
         }
         xSemaphoreGive(s_nodes_mtx);
@@ -362,9 +496,11 @@ static void print_table(void)
 
     printf("%-3s%-20s%-12s%-6s%-6s%s\n", "#", "MAC", "NAME", "RSSI", "HOPS", "AGE");
     int row = 0;
-    for (int i = 0; i < MAX_NODES; i++) {
+    for (int i = 0; i < MAX_NODES; i++)
+    {
         node_entry_t *n = &snap[i];
-        if (!n->in_use) continue;
+        if (!n->in_use)
+            continue;
 
         uint32_t age_s = (now - n->last_seen_ms) / 1000;
 
@@ -373,19 +509,23 @@ static void print_table(void)
                  n->mac[0], n->mac[1], n->mac[2], n->mac[3], n->mac[4], n->mac[5]);
 
         char rssi_str[8];
-        if (n->rssi_valid) snprintf(rssi_str, sizeof(rssi_str), "%d", n->rssi);
-        else               snprintf(rssi_str, sizeof(rssi_str), "N/A");
+        if (n->rssi_valid)
+            snprintf(rssi_str, sizeof(rssi_str), "%d", n->rssi);
+        else
+            snprintf(rssi_str, sizeof(rssi_str), "N/A");
 
         printf("%-3d%-20s%-12s%-6s%-6u%lus\n", row, mac_str, n->name, rssi_str, n->hops, (unsigned long)age_s);
         row++;
     }
-    if (row == 0) printf("(no nodes seen yet)\n");
+    if (row == 0)
+        printf("(no nodes seen yet)\n");
 }
 
 static void wifi_espnow_init(void)
 {
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -411,7 +551,6 @@ static void wifi_espnow_init(void)
     };
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
-
 }
 
 void app_main(void)
@@ -442,7 +581,7 @@ void app_main(void)
 
     // Start node discovery: announce ourselves and reap stale nodes.
     xTaskCreate(announce_task, "announce", 3072, NULL, 4, NULL);
-    xTaskCreate(reaper_task,   "reaper",   2560, NULL, 3, NULL);
+    xTaskCreate(reaper_task, "reaper", 2560, NULL, 3, NULL);
 
     printf("Commands:\n"
            "  list                 - show the node table\n"
@@ -452,49 +591,59 @@ void app_main(void)
     size_t line_len = 0;
     uint8_t chunk[64];
 
-    while (1) {
+    while (1)
+    {
         int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), 20 / portTICK_PERIOD_MS);
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n; i++)
+        {
             char c = (char)chunk[i];
-            if (c == '\n' || c == '\r') {
-                if (line_len == 0) continue;
+            if (c == '\n' || c == '\r')
+            {
+                if (line_len == 0)
+                    continue;
                 line[line_len] = '\0';
                 line_len = 0;
 
-                if (strcmp(line, "list") == 0) {
-                    print_table();            // console command, not sent over the air
+                if (strcmp(line, "l") == 0)
+                {
+                    print_table(); // console command, not sent over the air
                     continue;
                 }
 
                 // Split "<name> <message>" at the first space.
                 char *sp = strchr(line, ' ');
-                if (sp == NULL) {
+                if (sp == NULL)
+                {
                     printf("usage: <name> <message>\n");
                     continue;
                 }
                 *sp = '\0';
-                const char *target = line;       // e.g. "Adilet"
-                const char *body   = sp + 1;     // e.g. "привет мир"
+                const char *target = line; // e.g. "Adilet"
+                const char *body = sp + 1; // e.g. "привет мир"
 
                 uint8_t dest[6], nh[6];
-                if (!route_by_name(target, dest, nh)) {
+                if (!route_by_name(target, dest, nh))
+                {
                     printf("user \"%s\" not found (try \"list\")\n", target);
                     continue;
                 }
 
                 // Build a routed DATA frame: addressed to the next hop on the
                 // path, carrying the final destination so each hop can re-route.
-                chat_msg_t out = { .magic = CHAT_MAGIC, .msg_type = MSG_TYPE_DATA };
-                memcpy(out.origin,   s_my_mac, 6);
-                memcpy(out.dest,     dest, 6);
+                chat_msg_t out = {.magic = CHAT_MAGIC, .msg_type = MSG_TYPE_DATA};
+                memcpy(out.origin, s_my_mac, 6);
+                memcpy(out.dest, dest, 6);
                 memcpy(out.next_hop, nh, 6);
                 out.seq = next_seq();
                 out.ttl = MSG_TTL;
-                path_append(&out, s_my_mac);   // path starts at the origin
+                path_append(&out, s_my_mac); // path starts at the origin
                 snprintf(out.text, sizeof(out.text), "%s", body);
-                broadcast(&out);
+                /* Первый hop — unicast к непосредственному соседу */
+                send_unicast(nh, &out);
                 printf("[me -> %s] %s\n", target, body);
-            } else if (line_len < sizeof(line) - 1) {
+            }
+            else if (line_len < sizeof(line) - 1)
+            {
                 line[line_len++] = c;
             }
         }
